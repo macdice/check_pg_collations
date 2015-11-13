@@ -30,6 +30,9 @@ detection algorithm.  The database commands it generates should be
 given to psql to run as a user with sufficient privileges to run
 REINDEX commands.
 
+Since it needs a way to remember checksums between invocations, it
+generates statements to create a table on demand.
+
 Usage:
 
   check_pg_collations [options...] <connection-string>
