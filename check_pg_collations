@@ -15,8 +15,8 @@ import sys
 help = """check_pg_collations
 
 This script checksums the contents of all LC_COLLATE files referenced
-by a database's indexes, and checks if they should be rebuilt due to
-changes.
+by a database's indexes, and checks which indexes should be rebuilt
+due to changes.
 
 To do this, it connects to the database to read system catalogs, but
 it doesn't modify the database directly.  It is not necessary to
@@ -118,7 +118,7 @@ def probe_collation(locale_path, lc_collate):
 
 def find_referenced_lc_collate_values(cursor):
   """Find all LC_COLLATE values referenced by indexes in this database.
-Returns the empty string for 'default'."""
+     Returns the empty string for 'default'."""
   cursor.execute("""
     SELECT collcollate
       FROM pg_collation
@@ -216,7 +216,7 @@ def run(connection_string, assume_good, locale_path, schema, table):
       print "INSERT INTO %s.%s (lc_collate, path, modified, checksum)" % (schema, table)
       print "VALUES ('%s', '%s', pg_catalog.to_timestamp('%s'), '%s');" % (effective_lc_collate, path, mtime, checksum)
     elif last_checksum != checksum:
-      print "UPDATE %s.%s SET path = '%s', pg_catalog.to_timestamp('%s'), checksum = '%s' WHERE lc_collate = '%s';" % (schema, table, path, mtime, checksum, effective_lc_collate)
+      print "UPDATE %s.%s SET path = '%s', modified = pg_catalog.to_timestamp('%s'), checksum = '%s' WHERE lc_collate = '%s';" % (schema, table, path, mtime, checksum, effective_lc_collate)
 
 def usage_and_exit():
   """Print out the help message and die."""
