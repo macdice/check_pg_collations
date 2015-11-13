@@ -45,8 +45,8 @@ Valid options are:
     locale) that existing indexes are not corrupted; this options is
     not enabled by default (there is no good reason to assume that any
     pre-existing indexes are not corrupted, unless you are sure that
-    you haven't updated any operation system locale files since
-    creating all indexes is the database).
+    you haven't updated the operating system-supplied locale files
+    since creating all indexes in the database).
 
   --locale-path PATH
 
