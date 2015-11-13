@@ -1,0 +1,262 @@
+#!/usr/bin/python
+#
+# A script to notice when collations change since last time the script
+# was run, and produce DDL that would reindex all dependent indexes
+# and record their checksums for next time.
+#
+# (c) 2015 Thomas Munro <munro@ip9.org>
+
+import hashlib
+import os
+import psycopg2
+import re
+import sys
+
+help = """check_pg_collations
+
+This script checksums the contents of all LC_COLLATE files referenced
+by a database's indexes, and checks if they should be rebuilt due to
+changes.
+
+To do this, it connects to the database to read system catalogs, but
+it doesn't modify the database directly.  It is not necessary to
+connect to the database as a priviliged user.  Instead, it produces
+commands and commentary on standard out which would rebuild all
+indexes dependent on LC_COLLATE files whose MD5 checksums have
+changed, and record the relevant checksums for next time.  It also
+records the filename and last modified time of LC_COLLATE files for
+informational purposes, but these are not used as part of the change
+detection algorithm.  The database commands it generates should be
+given to psql to run as a user with sufficient privileges to run
+REINDEX commands.
+
+Usage:
+
+  check_pg_collations [options...] <connection-string>
+
+Valid options are:
+
+  --assume-good
+
+    Assume on first run (or first detection of a previously unused
+    locale) that existing indexes are not corrupted; this options is
+    not enabled by default (there is no good reason to assume that any
+    pre-existing indexes are not corrupted, unless you are sure that
+    you haven't updated any operation system locale files since
+    creating all indexes is the database).
+
+  --locale-path PATH
+
+    Provide the path where locale files can be found; defaults to
+    /usr/lib/locale or /usr/share/locale if they exist.
+
+  --table NAME
+
+    Set the name of last known checksum table (DDL to create this
+    table is generated on demand); defaults to "lc_collate_checksums".
+
+  --schema NAME
+
+    Set the schema for the last known checksum table; defaults to
+    "public".
+
+"""
+
+# Header included at top of output, if we generate any commands.
+header = """\set ON_ERROR_STOP 1"""
+
+# These locales don't have files to checksum, so we can ignore them.
+PSEUDO_LOCALES = ('C', 'POSIX')
+
+# If you don't supply the path to your locale files, we'll try to find an existing directory in this order.
+GUESS_LOCALE_PATHS = ("/usr/lib/locale", "/usr/share/locale")
+
+def guess_locale_path():
+  """Try to figure out where the locales might be on this system.  Used only if you don't provide a path explicitly."""
+  for path in GUESS_LOCALE_PATHS:
+    if os.path.exists(path):
+      return path
+  return None
+
+def find_lc_collate_path(locale_path, lc_collate):
+  """Find the path of the LC_COLLATE file for the given locale name on
+     this system."""
+  # BSD, MacOS, Solaris use just the locale name directly in paths.
+  path = locale_path + "/" + lc_collate + "/LC_COLLATE"
+  if os.path.exists(path):
+    return path
+  # Glibc (ie GNU/Linux systems) mangles the encoding part of the
+  # locale name in the pathnames it uses on disk; for some reason we
+  # can finish up with locale names in both mangled and unmangled form
+  # referenced in Postgres on Glibc systems, so if the locale name
+  # contains a point, we try to find it both ways.
+  point = lc_collate.find('.')
+  if point >= 0:
+    mangled_name = lc_collate[:point] + '.' + re.sub('[^a-z0-9]', '', lc_collate[point + 1:].lower())
+    path = locale_path + "/" + mangled_name + "/LC_COLLATE"
+    if os.path.exists(path):
+      return path
+  # Couldn't find it either way.
+  raise RuntimeError("Can't find the LC_COLLATE file for locale %s" % lc_collate)
+
+def hash_file_contents(path):
+  """Compute the MD5 hash of the contents of a file, and return it as a
+     hex string."""
+  hash = hashlib.md5()
+  with open(path, "rb") as file:
+    for block in iter(lambda: file.read(4096), b""):
+      hash.update(block)
+  return hash.hexdigest()
+
+def probe_collation(locale_path, lc_collate):
+  """Find the path, modified time and md5 hash of the collation file for
+     the given locale."""
+  path = find_lc_collate_path(locale_path, lc_collate)
+  mtime = os.path.getmtime(path)
+  checksum = hash_file_contents(path)
+  return path, mtime, checksum
+
+def find_referenced_lc_collate_values(cursor):
+  """Find all LC_COLLATE values referenced by indexes in this database.
+Returns the empty string for 'default'."""
+  cursor.execute("""
+    SELECT collcollate
+      FROM pg_collation
+     WHERE oid IN (SELECT DISTINCT unnest(indcollation)
+                     FROM pg_index)""")
+  return [lc_collate for lc_collate, in cursor.fetchall()]
+
+def find_default_lc_collate(cursor):
+  """Return the default LC_COLLATE used in this database."""
+  cursor.execute("SELECT datcollate FROM pg_database WHERE datname = current_database()")
+  return cursor.fetchone()[0]
+
+def check_if_table_exists(cursor, schema, table):
+  """Check if our checksum table exists yet."""
+  cursor.execute("SELECT COUNT(*) FROM pg_catalog.pg_tables WHERE schemaname = %s AND tablename = %s", (schema, table))
+  return cursor.fetchone()[0] == 1
+
+def find_all_indexes_referencing_lc_collate(cursor, lc_collate):
+  """Find the schema-qualified names of all indexes that reference a
+     given LC_COLLATE value, or the database default if the empty
+     string is given."""
+  cursor.execute("""
+    WITH index_coll(indexrelid, collid) AS (
+      SELECT indexrelid, UNNEST(indcollation) FROM pg_index
+    )
+    SELECT DISTINCT quote_ident(ns.nspname) || '.' || quote_ident(c.relname)
+      FROM pg_class c
+      JOIN pg_namespace ns ON c.relnamespace = ns.oid
+      JOIN index_coll ic ON ic.indexrelid = c.oid
+      JOIN pg_collation col ON ic.collid = col.oid
+     WHERE col.collcollate = %s""",
+	(lc_collate, ))
+  return [name for name in cursor.fetchall()]
+
+def find_last_checksum(cursor, schema, table, lc_collate):
+  """Find the last checksum for a given lc_collate value, or None."""
+  cursor.execute("SELECT checksum FROM %s.%s WHERE lc_collate = %%s" % (schema, table), (lc_collate,))
+  row = cursor.fetchone()
+  if row == None:
+    return None
+  else:
+    return row[0]
+
+def run(connection_string, assume_good, locale_path, schema, table):
+  """Main function."""
+  
+  # Connect to the database.
+  connection = psycopg2.connect(connection_string)
+  cursor = connection.cursor()
+  header_printed = False
+
+  # Create the table if this is the first time we've been run.
+  table_exists = check_if_table_exists(cursor, schema, table)
+  if not table_exists:
+    if not header_printed:
+      print header
+      header_printed = True
+    print "-- Create the table for recording last known checksums..."
+    print "CREATE TABLE %s.%s (lc_collate text NOT NULL PRIMARY KEY, path text NOT NULL, modified timestamptz NOT NULL, checksum text NOT NULL);" % (schema, table)
+
+  # Walk through all collations that are currently used in the database
+  for lc_collate in find_referenced_lc_collate_values(cursor):
+
+    # Check if we need to skip a pseudo-locale or use the default.
+    if lc_collate in PSEUDO_LOCALES:
+      continue
+    elif lc_collate == "":
+      effective_lc_collate = find_default_lc_collate(cursor)
+    else:
+      effective_lc_collate = lc_collate
+
+    # Probe the collation file on disk.
+    path, mtime, checksum = probe_collation(locale_path, effective_lc_collate)
+
+    # Check if we've already seen this locale before.
+    if table_exists:
+      last_checksum = find_last_checksum(cursor, schema, table, effective_lc_collate)
+    else:
+      last_checksum = None
+
+    # Check if we need to reindex.
+    if (last_checksum == None and not assume_good) or (last_checksum != None and last_checksum != checksum):
+      if not header_printed:
+        print header
+        header_printed = True
+      if last_checksum == None:
+        print "-- Collation %s not previously checksummed.  Rebuilding index(es) just to be sure..." % effective_lc_collate
+      else:
+        print "-- Collation %s has changed.  Rebuilding index(es)..." % effective_lc_collate
+      for index_name in find_all_indexes_referencing_lc_collate(cursor, lc_collate):
+        print "REINDEX INDEX %s;" % index_name
+
+    # Record the checksum for next time, if it's new or different.
+    if last_checksum == None:
+      print "INSERT INTO %s.%s (lc_collate, path, modified, checksum)" % (schema, table)
+      print "VALUES ('%s', '%s', pg_catalog.to_timestamp('%s'), '%s');" % (effective_lc_collate, path, mtime, checksum)
+    elif last_checksum != checksum:
+      print "UPDATE %s.%s SET path = '%s', pg_catalog.to_timestamp('%s'), checksum = '%s' WHERE lc_collate = '%s';" % (schema, table, path, mtime, checksum, effective_lc_collate)
+
+def usage_and_exit():
+  """Print out the help message and die."""
+  print help
+  sys.exit(1)
+      
+if __name__ == "__main__":
+  connection_string = None
+  assume_good = False
+  locale_path = None
+  schema = "public"
+  table = "lc_collate_checksums"
+  i = 1
+
+  while i < len(sys.argv):
+    arg = sys.argv[i]
+    more = i + 1 < len(sys.argv)
+    if arg == "--assume-good":
+      assume_good = True
+    elif arg == "--locale-path" and more:
+      i += 1
+      locale_path = sys.argv[i]
+    elif arg == "--schema" and more:
+      i += 1
+      schema = sys.argv[i]
+    elif arg == "--table" and more:
+      i += 1
+      table = sys.argv[i]
+    elif connection_string == None and not arg.startswith("-"):
+      connection_string = arg
+    else:
+      usage_and_exit()
+    i += 1
+  if connection_string == None:
+    usage_and_exit()
+  if locale_path == None:
+    locale_path = guess_locale_path()
+    if locale_path == None:
+      print "Can't guess the path of your locale directory -- please supply it with --locale-path"
+      sys.exit(1)
+
+  run(connection_string, assume_good, locale_path, schema, table)
+
