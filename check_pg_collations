@@ -66,7 +66,7 @@ Valid options are:
 """
 
 # Header included at top of output, if we generate any commands.
-header = """\set ON_ERROR_STOP 1"""
+HEADER = """\set ON_ERROR_STOP 1"""
 
 # These locales don't have files to checksum, so we can ignore them.
 PSEUDO_LOCALES = ('C', 'POSIX')
@@ -177,7 +177,7 @@ def run(connection_string, assume_good, locale_path, schema, table):
   table_exists = check_if_table_exists(cursor, schema, table)
   if not table_exists:
     if not header_printed:
-      print header
+      print HEADER
       header_printed = True
     print "-- Create the table for recording last known checksums..."
     print "CREATE TABLE %s.%s (lc_collate text NOT NULL PRIMARY KEY, path text NOT NULL, modified timestamptz NOT NULL, checksum text NOT NULL);" % (schema, table)
@@ -205,7 +205,7 @@ def run(connection_string, assume_good, locale_path, schema, table):
     # Check if we need to reindex.
     if (last_checksum == None and not assume_good) or (last_checksum != None and last_checksum != checksum):
       if not header_printed:
-        print header
+        print HEADER
         header_printed = True
       if last_checksum == None:
         print "-- Collation %s not previously checksummed.  Rebuilding index(es) just to be sure..." % effective_lc_collate
