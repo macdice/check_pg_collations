@@ -10,6 +10,8 @@
 # locales; how could we automatically detect which is being used and
 # look at the right locale files?
 #
+# TODO: Make an EXTENSION instead?
+#
 # (c) 2015 Thomas Munro <munro@ip9.org>
 
 import hashlib
