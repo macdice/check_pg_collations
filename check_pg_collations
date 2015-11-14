@@ -49,9 +49,9 @@ standby server in various replication/basebackup scenarios.
 
 The best time to run check_pg_collations would be after an operating
 system update that might have changed locale data, but before any
-updates/inserts that might corrupt indexes.  It may also be necessary
-to exit any backends that may be caching the old locale data when
-locales change.
+modifications that might corrupt indexes.  It may also be necessary to
+exit any backends that may be caching the old locale data when locales
+change.
 
 Usage:
 
