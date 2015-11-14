@@ -4,6 +4,12 @@
 # was run, and produce DDL that would reindex all dependent indexes
 # and record their checksums for next time.
 #
+# TODO: I heard that FreeBSD ships PostgreSQL patched to use libicu
+# for locales, and that some people corrupt their database by
+# accidentally switching between FreeBSD native locales and ICU
+# locales; how could we automatically detect which is being used and
+# look at the right locale files?
+#
 # (c) 2015 Thomas Munro <munro@ip9.org>
 
 import hashlib
@@ -18,26 +24,36 @@ This script checksums the contents of all LC_COLLATE files referenced
 by a database's indexes, and checks which indexes should be rebuilt
 due to changes.
 
-To do this, it connects to the database to read system catalogs, but
-it doesn't modify the database directly.  It is not necessary to
-connect to the database as a priviliged user.  Instead, it produces
-commands and commentary on standard out which would rebuild all
-indexes dependent on LC_COLLATE files whose MD5 checksums have
-changed, and record the relevant checksums for next time.  It also
-records the filename and last modified time of LC_COLLATE files for
-informational purposes, but these are not used as part of the change
-detection algorithm.  The database commands it generates should be
-given to psql to run as a user with sufficient privileges to run
-REINDEX commands.
+If run without the --now option, the script only produces commands and
+commentary on standard out which would rebuild all indexes dependent
+on LC_COLLATE files whose MD5 checksums have changed, and record the
+relevant checksums for next time.  With --now, it also runs the
+commands, which could potentially take a long time, locking tables as
+they are reindexed, and require privileges to run correctly (note the
+system catalogs may need to be reindexed, which would require
+superuser privileges).
 
-Since it needs a way to remember checksums between invocations, it
-generates statements to create a table on demand.
+The script records the filename and last modified time of LC_COLLATE
+files for informational purposes, but these are not used as part of
+the change detection algorithm triggering reindexing.  Since it needs
+a way to remember checksums between invocations, it creates a table
+(or just generates DDL that would do that, if --now is not specified).
+
+The best time to run check_pg_collations would be after a database
+upgrade that might have changed, but before any updates/inserts that
+might modify the indexes.  It may also be necessary to exit any
+backends that may be caching the old locale data when locales change.
 
 Usage:
 
   check_pg_collations [options...] <connection-string>
 
 Valid options are:
+
+  --now
+
+    Actually run the commands to rebuild indexes and record checksums,
+    rather than just printing them out.
 
   --assume-good
 
@@ -117,7 +133,7 @@ def probe_collation(locale_path, lc_collate):
   path = find_lc_collate_path(locale_path, lc_collate)
   mtime = os.path.getmtime(path)
   checksum = hash_file_contents(path)
-  return path, mtime, checksum
+  return path, int(mtime), checksum
 
 def find_referenced_lc_collate_values(cursor):
   """Find all LC_COLLATE values referenced by indexes in this database.
@@ -156,16 +172,16 @@ def find_all_indexes_referencing_lc_collate(cursor, lc_collate):
 	(lc_collate, ))
   return [name for name in cursor.fetchall()]
 
-def find_last_checksum(cursor, schema, table, lc_collate):
+def find_last_values(cursor, schema, table, lc_collate):
   """Find the last checksum for a given lc_collate value, or None."""
-  cursor.execute("SELECT checksum FROM %s.%s WHERE lc_collate = %%s" % (schema, table), (lc_collate,))
+  cursor.execute("SELECT path, EXTRACT(EPOCH FROM modified), checksum FROM %s.%s WHERE lc_collate = %%s" % (schema, table), (lc_collate,))
   row = cursor.fetchone()
   if row == None:
-    return None
+    return None, None, None
   else:
-    return row[0]
+    return row[0], int(row[1]), row[2]
 
-def run(connection_string, assume_good, locale_path, schema, table):
+def run(connection_string, assume_good, locale_path, schema, table, now):
   """Main function."""
   
   # Connect to the database.
@@ -176,13 +192,23 @@ def run(connection_string, assume_good, locale_path, schema, table):
   # Create the table if this is the first time we've been run.
   table_exists = check_if_table_exists(cursor, schema, table)
   if not table_exists:
-    if not header_printed:
+    if not now and not header_printed:
       print HEADER
       header_printed = True
     print "-- Create the table for recording last known checksums..."
-    print "CREATE TABLE %s.%s (lc_collate text NOT NULL PRIMARY KEY, path text NOT NULL, modified timestamptz NOT NULL, checksum text NOT NULL);" % (schema, table)
+    statement = "CREATE TABLE %s.%s (lc_collate text NOT NULL PRIMARY KEY, path text NOT NULL, modified timestamptz NOT NULL, checksum text NOT NULL);" % (schema, table)
+    print statement
+    if now:
+      cursor.execute(statement)
 
-  # Walk through all collations that are currently used in the database
+  # Walk through all collations that are currently used in the
+  # database, and build up a list of (path, mtime, checksum) tuples
+  # (we do this upfront before doing any REINDEXing; this avoids a
+  # subtle race condition if locales are updated while we are running
+  already_reindexed = []
+  probed_values = []
+  new_locale_metadata = [] # values to insert
+  changed_locale_metadata = [] # values to update
   for lc_collate in find_referenced_lc_collate_values(cursor):
 
     # Check if we need to skip a pseudo-locale or use the default.
@@ -195,31 +221,65 @@ def run(connection_string, assume_good, locale_path, schema, table):
 
     # Probe the collation file on disk.
     path, mtime, checksum = probe_collation(locale_path, effective_lc_collate)
+    probed_values.append((lc_collate, effective_lc_collate, path, mtime, checksum))
+
+  # Walk through all the probed values from above and check if any
+  # have changed.  While we do that, we remember anything that we
+  # reindex, to avoid double-reindexing an index that involves more
+  # than one collation.
+  for lc_collate, effective_lc_collate, path, mtime, checksum in probed_values:
 
     # Check if we've already seen this locale before.
     if table_exists:
-      last_checksum = find_last_checksum(cursor, schema, table, effective_lc_collate)
+      last_path, last_mtime, last_checksum = find_last_values(cursor, schema, table, effective_lc_collate)
     else:
-      last_checksum = None
+      last_path, last_mtime, last_checksum = (None, None, None)
 
     # Check if we need to reindex.
-    if (last_checksum == None and not assume_good) or (last_checksum != None and last_checksum != checksum):
-      if not header_printed:
+    new_locale = last_checksum == None
+    checksum_changed = (not new_locale) and (checksum != last_checksum)
+    reindex = (new_locale and not assume_good) or (checksum != last_checksum)
+    if reindex:
+      if not now and not header_printed:
         print HEADER
         header_printed = True
-      if last_checksum == None:
+      if new_locale:
         print "-- Collation %s not previously checksummed.  Rebuilding index(es) just to be sure..." % effective_lc_collate
       else:
         print "-- Collation %s has changed.  Rebuilding index(es)..." % effective_lc_collate
       for index_name in find_all_indexes_referencing_lc_collate(cursor, lc_collate):
-        print "REINDEX INDEX %s;" % index_name
+        if index_name in already_reindexed:
+          print "-- (skipping multi-collation index %s because it was already reindexed)" % index_name
+        else:          
+          statement = "REINDEX INDEX %s;" % index_name
+          print statement
+          if now:
+            cursor.execute(statement)
+          already_reindexed.append(index_name)
 
-    # Record the checksum for next time, if it's new or different.
-    if last_checksum == None:
-      print "INSERT INTO %s.%s (lc_collate, path, modified, checksum)" % (schema, table)
-      print "VALUES ('%s', '%s', pg_catalog.to_timestamp('%s'), '%s');" % (effective_lc_collate, path, mtime, checksum)
-    elif last_checksum != checksum:
-      print "UPDATE %s.%s SET path = '%s', modified = pg_catalog.to_timestamp('%s'), checksum = '%s' WHERE lc_collate = '%s';" % (schema, table, path, mtime, checksum, effective_lc_collate)
+    # Record the metadata for next time, if it's new or different.  We
+    # will update that at the end.
+    if new_locale:
+      new_locale_metadata.append((effective_lc_collate, path, mtime, checksum))
+    elif (checksum, mtime, path) != (last_checksum, last_mtime, last_path):
+      changed_locale_metadata.append((effective_lc_collate, path, mtime, checksum))
+
+  # Insert and update the locale metadata now that we have
+  # successfully reindexed everything that needed it.
+  if len(new_locale_metadata) > 0 or len(changed_locale_metadata):
+    print "-- Recording locale checksum and other metadata for next time..."
+  for lc_collate, path, mtime, checksum in new_locale_metadata:
+    statement = "INSERT INTO %s.%s (lc_collate, path, modified, checksum) VALUES ('%s', '%s', pg_catalog.to_timestamp('%s'), '%s');" % (schema, table, lc_collate, path, mtime, checksum)
+    print statement
+    if now:
+      cursor.execute(statement)    
+  for lc_collate, path, mtime, checksum in changed_locale_metadata:
+    statement = "UPDATE %s.%s SET path = '%s', modified = pg_catalog.to_timestamp('%s'), checksum = '%s' WHERE lc_collate = '%s';" % (schema, table, path, mtime, checksum, lc_collate)
+    print statement
+    if now:
+      cursor.execute(statement)
+  if now:
+    cursor.execute("COMMIT")
 
 def usage_and_exit():
   """Print out the help message and die."""
@@ -232,6 +292,7 @@ if __name__ == "__main__":
   locale_path = None
   schema = "public"
   table = "lc_collate_checksums"
+  now = False
   i = 1
 
   while i < len(sys.argv):
@@ -248,6 +309,8 @@ if __name__ == "__main__":
     elif arg == "--table" and more:
       i += 1
       table = sys.argv[i]
+    elif arg == "--now":
+      now = True
     elif connection_string == None and not arg.startswith("-"):
       connection_string = arg
     else:
@@ -261,5 +324,5 @@ if __name__ == "__main__":
       print "Can't guess the path of your locale directory -- please supply it with --locale-path"
       sys.exit(1)
 
-  run(connection_string, assume_good, locale_path, schema, table)
+  run(connection_string, assume_good, locale_path, schema, table, now)
 
