@@ -1,0 +1,29 @@
+A simple script to detect changes in the LC_COLLATE files supplied by
+your operating system, that PostgreSQL depends on for implementing
+'collations'.
+
+Depedencies: python, python-psycopg2
+
+When collation definitions change, btree indexes can become corrupted
+as the ordering of strings can change.  This script can generate
+appropriate REINDEX commands to repair that type of corruption, and,
+optionally, run the commands.
+
+See the output of check_pg_collations --help for more information.
+
+If no changes are detected since last time, it prints and does
+nothing.  If changes are detected, or if it hasn't run before, or
+detects that your database has started using a locale that it hasn't
+checksummed before, it rebuilds all dependent indexes.  Here is an
+example of the output of the script:
+
+-- Collation en_GB.UTF-8 has changed.  Rebuilding index(es)...
+REINDEX INDEX public.lc_collate_checksums_pkey;
+REINDEX INDEX pg_catalog.pg_shseclabel_object_index;
+REINDEX INDEX pg_catalog.pg_seclabel_object_index;
+-- Collation fr_FR.utf8 not previously checksummed.  Rebuilding index(es) just to be sure...
+REINDEX INDEX public.multi;
+REINDEX INDEX public.foo1_french_key;
+-- Recording locale checksum and other metadata for next time...
+INSERT INTO public.lc_collate_checksums (lc_collate, path, modified, checksum) VALUES ('fr_FR.utf8', '/usr/lib/locale/fr_FR.utf8/LC_COLLATE', pg_catalog.to_timestamp('1440971614'), '5aee00a13cb3e717fd8cb6dbfc5ebd4c');
+UPDATE public.lc_collate_checksums SET path = '/usr/lib/locale/en_GB.utf8/LC_COLLATE', modified = pg_catalog.to_timestamp('1440971614'), checksum = '5aee00a13cb3e717fd8cb6dbfc5ebd4c' WHERE lc_collate = 'en_GB.UTF-8';
