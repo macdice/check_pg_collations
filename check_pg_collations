@@ -8,7 +8,9 @@
 # for locales, and that some people corrupt their database by
 # accidentally switching between FreeBSD native locales and ICU
 # locales; how could we automatically detect which is being used and
-# look at the right locale files?
+# look at the right locale files?  Possibly you can run pg_config to
+# find out if postgres was configured with icu, and icu-config to find
+# the path to the locale files.
 #
 # TODO: Make an EXTENSION instead?
 #
