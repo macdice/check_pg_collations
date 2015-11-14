@@ -43,10 +43,11 @@ the change detection algorithm triggering reindexing.  Since it needs
 a way to remember checksums between invocations, it creates a table
 (or just generates DDL that would do that, if --now is not specified).
 
-The best time to run check_pg_collations would be after a database
-upgrade that might have changed, but before any updates/inserts that
-might modify the indexes.  It may also be necessary to exit any
-backends that may be caching the old locale data when locales change.
+The best time to run check_pg_collations would be after an operating
+system update that might have changed locale data, but before any
+updates/inserts that might modify the indexes.  It may also be
+necessary to exit any backends that may be caching the old locale data
+when locales change.
 
 Usage:
 
