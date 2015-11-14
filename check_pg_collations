@@ -247,7 +247,9 @@ def run(connection_string, assume_good, locale_path, schema, table, now):
     # Check if we need to reindex.
     new_locale = last_checksum == None
     checksum_changed = (not new_locale) and (checksum != last_checksum)
-    reindex = (new_locale and not assume_good) or (checksum != last_checksum)
+    reindex = (new_locale and not assume_good) or (not new_locale and checksum != last_checksum)
+    if new_locale and assume_good:
+      print "-- Collation %s not previously checksummed.  Assuming dependent indexes are not corrupted, as requested..." % effective_lc_collate
     if reindex:
       if not now and not header_printed:
         print HEADER
