@@ -6,11 +6,12 @@
 #
 # TODO: I heard that FreeBSD ships PostgreSQL patched to use libicu
 # for locales, and that some people corrupt their database by
-# accidentally switching between FreeBSD native locales and ICU
-# locales; how could we automatically detect which is being used and
-# look at the right locale files?  Possibly you can run pg_config to
-# find out if postgres was configured with icu, and icu-config to find
-# the path to the locale files.
+# accidentally switching between FreeBSD native locales when
+# upgrading, and ICU locales; how could we teach guess_locale_paths to
+# detect which is being used and look at the right locale files?
+# Possibly you can run pg_config to find out if postgres was
+# configured with icu, and icu-config to find the path to the locale
+# files.
 #
 # TODO: Make an EXTENSION instead?
 #
@@ -42,6 +43,9 @@ files for informational purposes, but these are not used as part of
 the change detection algorithm triggering reindexing.  Since it needs
 a way to remember checksums between invocations, it creates a table
 (or just generates DDL that would do that, if --now is not specified).
+
+This could also be used to check that the collations match on a
+standby server in various replication/basebackup scenarios.
 
 The best time to run check_pg_collations would be after an operating
 system update that might have changed locale data, but before any
